@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Sequence, Union, List, Optional, Tuple, Dict, Callable, Any
 
 import pytz
-from feast import RepoConfig, FeatureTable, FeatureView, Entity
+from feast import RepoConfig, FeatureView, Entity
 from feast.infra.key_encoding_utils import serialize_entity_key
 from feast.infra.online_stores.online_store import OnlineStore
 from feast.protos.feast.types.EntityKey_pb2 import EntityKey as EntityKeyProto
@@ -57,7 +57,7 @@ class MySQLOnlineStore(OnlineStore):
     def online_write_batch(
             self,
             config: RepoConfig,
-            table: Union[FeatureTable, FeatureView],
+            table: FeatureView,
             data: List[
                 Tuple[EntityKeyProto, Dict[str, ValueProto], datetime, Optional[datetime]]
             ],
@@ -83,24 +83,25 @@ class MySQLOnlineStore(OnlineStore):
 
     @staticmethod
     def write_to_table(created_ts, cur, entity_key_bin, feature_name, project, table, timestamp, val):
+        # cur.execute(
+        #     f"""
+        #                 UPDATE {_table_id(project, table)}
+        #                 SET value = %s, event_ts = %s, created_ts = %s
+        #                 WHERE (entity_key = %s AND feature_name = %s)
+        #             """,
+        #     (
+        #         # SET
+        #         val.SerializeToString(),
+        #         timestamp,
+        #         created_ts,
+        #         # WHERE
+        #         entity_key_bin,
+        #         feature_name,
+        #     ),
+        # )
+        # "replace into" is an upsert
         cur.execute(
-            f"""
-                        UPDATE {_table_id(project, table)}
-                        SET value = %s, event_ts = %s, created_ts = %s
-                        WHERE (entity_key = %s AND feature_name = %s)
-                    """,
-            (
-                # SET
-                val.SerializeToString(),
-                timestamp,
-                created_ts,
-                # WHERE
-                entity_key_bin,
-                feature_name,
-            ),
-        )
-        cur.execute(
-            f"""INSERT INTO {_table_id(project, table)}
+            f"""REPLACE INTO {_table_id(project, table)}
                         (entity_key, feature_name, value, event_ts, created_ts)
                         VALUES (%s, %s, %s, %s, %s)""",
             (
@@ -115,7 +116,7 @@ class MySQLOnlineStore(OnlineStore):
     def online_read(
             self,
             config: RepoConfig,
-            table: Union[FeatureTable, FeatureView],
+            table: FeatureView,
             entity_keys: List[EntityKeyProto],
             requested_features: Optional[List[str]] = None,
     ) -> List[Tuple[Optional[datetime], Optional[Dict[str, ValueProto]]]]:
@@ -150,8 +151,8 @@ class MySQLOnlineStore(OnlineStore):
     def update(
             self,
             config: RepoConfig,
-            tables_to_delete: Sequence[Union[FeatureTable, FeatureView]],
-            tables_to_keep: Sequence[Union[FeatureTable, FeatureView]],
+            tables_to_delete: Sequence[FeatureView],
+            tables_to_keep: Sequence[FeatureView],
             entities_to_delete: Sequence[Entity],
             entities_to_keep: Sequence[Entity],
             partial: bool,
@@ -166,10 +167,15 @@ class MySQLOnlineStore(OnlineStore):
             cur.execute(
                 f"CREATE TABLE IF NOT EXISTS {_table_id(project, table)} (entity_key VARCHAR(512), feature_name VARCHAR(256), value BLOB, event_ts timestamp, created_ts timestamp,  PRIMARY KEY(entity_key, feature_name))"
             )
-            cur.execute(
-                f"ALTER TABLE {_table_id(project, table)} ADD INDEX {_table_id(project, table)}_ek (entity_key);"
-            )
-
+            # the index may exist already, we have to be careful here. See https://dba.stackexchange.com/questions/24531/mysql-create-index-if-not-exists
+            try:
+                #
+                cur.execute(
+                    f"ALTER TABLE {_table_id(project, table)} ADD INDEX {_table_id(project, table)}_ek (entity_key);"
+                )
+            except connector.errors.ProgrammingError:
+                pass
+            #
         for table in tables_to_delete:
             cur.execute(
                 f"DROP INDEX {_table_id(project, table)}_ek ON {_table_id(project, table)};"
@@ -179,7 +185,7 @@ class MySQLOnlineStore(OnlineStore):
     def teardown(
             self,
             config: RepoConfig,
-            tables: Sequence[Union[FeatureTable, FeatureView]],
+            tables: Sequence[FeatureView],
             entities: Sequence[Entity],
     ):
         conn = self._get_conn(config)
@@ -193,8 +199,8 @@ class MySQLOnlineStore(OnlineStore):
             cur.execute(f"DROP TABLE IF EXISTS {_table_id(project, table)}")
 
 
-def _table_id(project: str, table: Union[FeatureTable, FeatureView]) -> str:
-    return f"{project}_{table.name}"
+def _table_id(project: str, table: FeatureView) -> str:
+    return f"{project}_{table.name}".replace('get_historical_features_types', 'ghft').replace('get_online_features_types', 'goft')
 
 
 def _to_naive_utc(ts: datetime):
